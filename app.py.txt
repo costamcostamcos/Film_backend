@@ -1,0 +1,199 @@
+﻿# app.py - plik głównej aplikacji Flask
+from flask import Flask, request, jsonify
+from flask_cors import CORS # Potrzebne do obsługi CORS
+import requests
+import os
+
+
+app = Flask(__name__)
+# Włączamy CORS dla wszystkich domen. W produkcji warto ograniczyć do konkretnej domeny Google Sites!
+CORS(app) 
+
+
+# --- Konfiguracja klucza API TMDB ---
+# Klucz API TMDB NIE POWINIEN BYĆ zakodowany na stałe tutaj!
+# Pobieramy go ze zmiennych środowiskowych, co jest bezpieczną praktyką.
+# Upewnij się, że ustawisz zmienną środowiskową o nazwie TMDB_API_KEY w swoim środowisku hostingowym.
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+
+
+if not TMDB_API_KEY:
+    # Ważne: W środowisku produkcyjnym, zamiast rzucać wyjątek, można zalogować błąd
+    # i zwrócić odpowiedź o błędzie do klienta.
+    print("Błąd: Brak klucza TMDB_API_KEY w zmiennych środowiskowych!")
+    # W celu lokalnych testów możesz tymczasowo odkomentować poniższą linię,
+    # ale usuń ją przed wdrożeniem na produkcję!
+    # TMDB_API_KEY = "TWOJ_KLUCZ_API_TMDB_TUTAJ" 
+
+
+# Bazowy URL dla API TMDB
+TMDB_BASE_URL = "https://api.themoviedb.org/3"
+TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500" # URL dla plakatów filmowych
+
+
+# --- Funkcje pomocnicze do komunikacji z TMDB API ---
+
+
+def fetch_from_tmdb(endpoint, params=None):
+    """Pomocnicza funkcja do wykonywania zapytań do TMDB API."""
+    if params is None:
+        params = {}
+    
+    params['api_key'] = TMDB_API_KEY
+    params['language'] = 'pl-PL' # Język polski dla wyników
+
+
+    try:
+        response = requests.get(f"{TMDB_BASE_URL}/{endpoint}", params=params)
+        response.raise_for_status() # Rzuca wyjątek dla kodów statusu HTTP 4xx/5xx
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Błąd komunikacji z TMDB API dla endpointu {endpoint}: {e}")
+        return None
+
+
+def get_youtube_video_id(videos_data):
+    """Pobiera ID trailera YouTube z danych wideo z TMDB."""
+    if videos_data and videos_data.get('results'):
+        for video in videos_data['results']:
+            if video['site'] == 'YouTube' and video['type'] == 'Trailer':
+                return video['key']
+    return None
+
+
+def process_movie_data(tmdb_movie_data):
+    """Przetwarza surowe dane z TMDB na format zrozumiały dla frontendu."""
+    if not tmdb_movie_data:
+        return None
+
+
+    # TMDB nie dostarcza łatwo dostępu do "Awards", "Fun Facts", "Scenography", "Music", "Production Details"
+    # Te dane trzeba by pozyskać z innych źródeł (np. OMDb, Wikipedia) lub ręcznie uzupełnić.
+    # W tym przykładzie symulujemy je lub ignorujemy, by zachować prostotę.
+
+
+    # Pobieranie trailera
+    trailer_url = None
+    if tmdb_movie_data.get('videos'):
+        youtube_key = get_youtube_video_id(tmdb_movie_data['videos'])
+        if youtube_key:
+            trailer_url = f"https://www.youtube.com/watch?v={youtube_key}"
+
+
+    return {
+        'id': tmdb_movie_data.get('id'),
+        'title': tmdb_movie_data.get('title'),
+        'original_title': tmdb_movie_data.get('original_title'),
+        'year': tmdb_movie_data.get('release_date', '')[:4] if tmdb_movie_data.get('release_date') else 'N/A',
+        'runtime': tmdb_movie_data.get('runtime'),
+        'overview': tmdb_movie_data.get('overview'),
+        'imdb_id': tmdb_movie_data.get('imdb_id'),
+        'trailer_url': trailer_url,
+        'imdb_rating': tmdb_movie_data.get('vote_average'), # Ocena TMDB (zazwyczaj 0-10)
+        'director': next((crew['name'] for crew in tmdb_movie_data.get('credits', {}).get('crew', []) if crew['job'] == 'Director'), 'N/A'),
+        'cast': [actor['name'] for actor in tmdb_movie_data.get('credits', {}).get('cast', [])[:5]], # Top 5 aktorów
+        'genres': [genre['name'] for genre in tmdb_movie_data.get('genres', [])],
+        'poster_url': f"{TMDB_IMAGE_BASE_URL}{tmdb_movie_data['poster_path']}" if tmdb_movie_data.get('poster_path') else None,
+        # Poniższe pola będą puste lub symulowane, bo TMDB ich nie dostarcza bezpośrednio w detalu filmu
+        'awards': ["Brak danych z TMDB, sprawdź OMDb lub inne źródła."] if not tmdb_movie_data.get('awards') else tmdb_movie_data.get('awards'),
+        'fun_facts': ["Brak danych z TMDB, sprawdź inne źródła."] if not tmdb_movie_data.get('fun_facts') else tmdb_movie_data.get('fun_facts'),
+        'production_details': "Brak szczegółowych danych z TMDB. Zazwyczaj budżet/box office.", # Można spróbować wyciągnąć np. budget/revenue jeśli są
+        'scenography': 'N/A', # Symulacja - TMDB ma w credits, ale trudniej to jednoznacznie wyciągnąć
+        'music': 'N/A' # Symulacja
+    }
+
+
+# --- Endpointy API ---
+
+
+@app.route('/api/search_movies', methods=['GET'])
+def search_movies():
+    """Endpoint do wyszukiwania filmów po temacie/słowie kluczowym."""
+    topic = request.args.get('topic')
+    if not topic:
+        return jsonify({"error": "Brak tematu do wyszukania"}), 400
+
+
+    # Używamy endpointu 'search/movie' TMDB
+    tmdb_data = fetch_from_tmdb('search/movie', {'query': topic})
+
+
+    if not tmdb_data:
+        return jsonify([]), 500 # W przypadku błędu TMDB
+
+
+    movies_list = []
+    # Sortowanie wyników po popularności i filtrowanie do 30
+    sorted_results = sorted(tmdb_data.get('results', []), key=lambda x: x.get('popularity', 0), reverse=True)
+    
+    for movie_data in sorted_results[:30]:
+        # Minimalne dane dla kafelka
+        if movie_data.get('poster_path'): # Tylko filmy z plakatem
+            movies_list.append({
+                'id': movie_data['id'],
+                'title': movie_data['title'],
+                'original_title': movie_data.get('original_title'),
+                'year': movie_data.get('release_date', '')[:4] if movie_data.get('release_date') else 'N/A',
+                'poster_url': f"{TMDB_IMAGE_BASE_URL}{movie_data['poster_path']}",
+                'imdbRating': movie_data.get('vote_average') # To jest ocena TMDB, niekoniecznie IMDb
+            })
+    return jsonify(movies_list)
+
+
+@app.route('/api/movie_details/<int:movie_id>', methods=['GET'])
+def movie_details(movie_id):
+    """Endpoint do pobierania szczegółów konkretnego filmu."""
+    # Używamy endpointu 'movie/{movie_id}' TMDB z dodatkowymi informacjami
+    tmdb_data = fetch_from_tmdb(f'movie/{movie_id}', {'append_to_response': 'videos,credits,external_ids'})
+
+
+    if not tmdb_data:
+        return jsonify({"error": "Nie znaleziono filmu lub błąd API"}), 404
+
+
+    # Przetwarzamy dane TMDB na oczekiwany format
+    details = process_movie_data(tmdb_data)
+
+
+    # Dodatkowe symulowane dane, które TMDB nie dostarcza bezpośrednio w endpointach
+    # Zauważ, że te dane są stałe i nie dynamiczne dla każdego filmu z TMDB!
+    # Jeśli potrzebujesz dynamicznych nagród/ciekawostek, musisz użyć innych API (np. OMDb)
+    # lub zbudować własną bazę danych tych informacji.
+    details['awards'] = [
+        "Przykładowa nagroda: Oscar za Najlepszy Film (jeśli by istniała w bazie)",
+        "Nominacja do Złotego Globu"
+    ]
+    details['fun_facts'] = [
+        "To jest przykładowa ciekawostka z planu filmowego.",
+        "Aktor musiał nauczyć się dziwnego języka do tej roli."
+    ]
+    # Uzupełniamy production_details o budget i revenue z TMDB, jeśli dostępne
+    if tmdb_data.get('budget'):
+        details['production_details'] += f" Budżet: ${tmdb_data['budget']:,d}."
+    if tmdb_data.get('revenue'):
+        details['production_details'] += f" Box Office: ${tmdb_data['revenue']:,d}."
+
+
+
+
+    # Przykładowa symulacja dostępności na platformach (to by wymagało zewnętrznego API!)
+    details['availability'] = [
+        {"platform": "Netflix", "link": "https://www.netflix.com/", "type": "Subskrypcja"},
+        {"platform": "HBO Max", "link": "https://www.hbomax.com/", "type": "Subskrypcja"},
+        {"platform": "Player", "link": "https://player.pl/", "type": "Wypożyczenie/Kupno"}
+    ]
+
+
+    return jsonify(details)
+
+
+# --- Uruchomienie aplikacji ---
+if __name__ == '__main__':
+    # Aby uruchomić lokalnie (do testów):
+    # 1. Ustaw zmienną środowiskową:
+    #    Na Linux/macOS: export TMDB_API_KEY="Twój_Klucz_TMDB"
+    #    Na Windows (CMD): set TMDB_API_KEY="Twój_Klucz_TMDB"
+    #    Na Windows (PowerShell): $env:TMDB_API_KEY="Twój_Klucz_TMDB"
+    # 2. Uruchom aplikację: python app.py
+    # Domyślnie uruchomi się na http://127.0.0.1:5000/
+    app.run(debug=True)
